@@ -1,27 +1,31 @@
 // src/agents/nodes.js
 // All 8 LangGraph agent node functions
 
-const { ChatGoogleGenerativeAI } = require('@langchain/google-genai');
-const { HumanMessage, SystemMessage, AIMessage } = require('@langchain/core/messages');
-const pool          = require('../db/pool');
-const scraper       = require('../tools/scraper.tool');
-const vectorSearch  = require('../tools/vectorSearch.tool');
+// ── dotenv MUST be first — before any process.env access ─────────────────────
 require('dotenv').config();
 
-// ── Shared LLM ─────────────────────────────────────────────────────────────────
-const llm = new ChatGoogleGenerativeAI({
-  model: 'gemini-1.5-flash',
-  apiKey: process.env.GEMINI_API_KEY,
-  temperature: 0.3,
-  maxOutputTokens: 8192,
-  streaming: true,
-});
+const { ChatGoogleGenerativeAI } = require('@langchain/google-genai');
+const { HumanMessage, SystemMessage, AIMessage } = require('@langchain/core/messages');
+const pool = require('../db/pool');
+const scraper = require('../tools/scraper.tool');
+const vectorSearch = require('../tools/vectorSearch.tool');
+const heatmapTool = require('../tools/heatmap.tool');
+const recTool = require('../tools/recommendation.tool');
+const sse = require('../utils/sseRegistry');
 
-// ── SSE helper (agents write directly to the response stream) ──────────────────
-function emit(writer, event, data) {
-  if (writer && !writer.writableEnded) {
-    writer.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+// ── Lazy LLM singleton — created on first use, after dotenv has loaded ─────────
+let _llm = null;
+function getLLM() {
+  if (!_llm) {
+    _llm = new ChatGoogleGenerativeAI({
+      model: 'gemini-1.5-flash',
+      apiKey: process.env.GEMINI_API_KEY,
+      temperature: 0.3,
+      maxOutputTokens: 8192,
+      streaming: true,
+    });
   }
+  return _llm;
 }
 
 // ── Utility: safe JSON parse from LLM output ───────────────────────────────────
@@ -39,13 +43,27 @@ function safeParseJSON(text, fallback = {}) {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // AGENT 1 — Orchestrator
-// Reads the latest user message and decides which agent to route to.
+// Routes the user message to the right agent.
+// BUG FIX: also checks state to handle mid-flow re-entries (e.g. preference reply)
 // ══════════════════════════════════════════════════════════════════════════════
 async function orchestratorNode(state) {
   const last = state.messages[state.messages.length - 1];
-  const text = typeof last.content === 'string' ? last.content : '';
+  const text = typeof last?.content === 'string' ? last.content : '';
 
-  const result = await llm.invoke([
+  // ── State-based routing (takes priority over message content) ────────────
+  // If pages were scraped but preferences not collected yet → user is replying
+  // to the "tell me your design goals" question. Route to design_preference.
+  const hasScrapedPages = Object.keys(state.scraped_pages ?? {}).length > 0;
+  if (hasScrapedPages && !state.design_prefs_collected) {
+    return {
+      intent: 'design_preference_reply',
+      next_node: 'design_preference',
+      current_stage: 'gathering_prefs',
+    };
+  }
+
+  // ── Message-content routing ───────────────────────────────────────────────
+  const result = await getLLM().invoke([
     new SystemMessage(
       `You are a routing agent. Classify the user's message into exactly one intent:
 - "analyze_website"  — user wants to analyse a URL or pasted HTML
@@ -64,30 +82,29 @@ Respond ONLY with JSON: { "intent": "<value>", "site_url": "<url or null>" }`
 
   const routeMap = {
     analyze_website: 'dom_intake',
-    enhance_code:    'code_enhancer',
-    heatmap_query:   'heatmap_analyzer',
-    general_chat:    'general_chat',
+    enhance_code: 'code_enhancer',
+    heatmap_query: 'heatmap_analyzer',
+    general_chat: 'general_chat',
   };
 
   return {
-    intent:    parsed.intent,
+    intent: parsed.intent,
     next_node: routeMap[parsed.intent] ?? 'general_chat',
-    site_url:  parsed.site_url ?? state.site_url,
+    site_url: parsed.site_url ?? state.site_url,
     current_stage: 'routing',
   };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // AGENT 2 — DOM Intake
-// Scrapes the website with Puppeteer, classifies site type, saves pages to DB.
+// Scrapes the website, classifies site type, saves pages to DB.
 // ══════════════════════════════════════════════════════════════════════════════
 async function domIntakeNode(state) {
-  const writer = state._sseWriter;
-  const last   = state.messages[state.messages.length - 1];
-  const text   = typeof last.content === 'string' ? last.content : '';
+  const threadId = state.thread_id;
+  const last = state.messages[state.messages.length - 1];
+  const text = typeof last?.content === 'string' ? last.content : '';
 
-  // Pull URL from message if not already in state
-  const urlMatch  = text.match(/https?:\/\/[^\s]+/);
+  const urlMatch = text.match(/https?:\/\/[^\s]+/);
   const targetUrl = state.site_url ?? urlMatch?.[0];
 
   if (!targetUrl) {
@@ -99,19 +116,17 @@ async function domIntakeNode(state) {
     };
   }
 
-  emit(writer, 'stage', { stage: 'scraping', message: `Scraping ${targetUrl}…`, progress: 5 });
+  sse.emit(threadId, 'stage', { stage: 'scraping', message: `Scraping ${targetUrl}…`, progress: 5 });
 
   try {
     const pages = await scraper.scrapeWebsite(targetUrl, { maxPages: 5 });
 
-    // Classify site type
-    const classResult = await llm.invoke([
+    const classResult = await getLLM().invoke([
       new SystemMessage('Respond ONLY with JSON: { "site_type": "ecommerce|saas|portfolio|restaurant|blog|agency|other" }'),
       new HumanMessage(`URL: ${targetUrl}\nPages: ${Object.keys(pages).join(', ')}\nTitles: ${Object.values(pages).map(p => p.page_title).join(', ')}`),
     ]);
     const { site_type = 'other' } = safeParseJSON(classResult.content, { site_type: 'other' });
 
-    // Persist scraped pages to DB
     if (state.session_id) {
       for (const [pageKey, pageData] of Object.entries(pages)) {
         await pool.query(
@@ -130,14 +145,14 @@ async function domIntakeNode(state) {
     }
 
     const pageList = Object.keys(pages).map(k => `• \`${k}\` (${pages[k].page_type})`).join('\n');
-    emit(writer, 'stage', { stage: 'scraping_done', progress: 20 });
+    sse.emit(threadId, 'stage', { stage: 'scraping_done', progress: 20 });
 
     return {
-      site_url:         targetUrl,
+      site_url: targetUrl,
       site_type,
-      scraped_pages:    pages,
+      scraped_pages: pages,
       pages_to_analyze: Object.keys(pages),
-      current_stage:    'gathering_prefs',
+      current_stage: 'gathering_prefs',
       messages: [new AIMessage(
         `✅ **Scraped ${Object.keys(pages).length} pages** from \`${targetUrl}\`\n\n` +
         `${pageList}\n\n` +
@@ -150,7 +165,7 @@ async function domIntakeNode(state) {
       )],
     };
   } catch (err) {
-    emit(writer, 'error', { message: err.message });
+    sse.emit(threadId, 'error', { message: err.message });
     return {
       current_stage: 'error',
       error: err.message,
@@ -166,34 +181,36 @@ async function domIntakeNode(state) {
 // Parses the user's design goals from their reply.
 // ══════════════════════════════════════════════════════════════════════════════
 async function designPreferenceNode(state) {
-  if (state.design_prefs_collected) return { next_node: 'benchmark_rag' };
+  if (state.design_prefs_collected) {
+    return { next_node: 'benchmark_rag' };
+  }
 
   const last = state.messages[state.messages.length - 1];
+
+  // If last message is not human (e.g. we just ran dom_intake), wait.
   if (!last || last._getType?.() !== 'human') {
-    // Nothing to parse yet — just wait
     return { current_stage: 'gathering_prefs' };
   }
 
   const text = typeof last.content === 'string' ? last.content : '';
 
-  const result = await llm.invoke([
+  const result = await getLLM().invoke([
     new SystemMessage(
       `Extract design preferences. Respond ONLY with JSON:
 {
-  "style":           "dark-modern|minimal|bold|corporate|playful|luxury|other",
-  "priority":        "conversions|aesthetics|mobile-ux|accessibility|all",
-  "priorityLaws":    ["fitts","hicks","gestalt","fpattern","hierarchy","typography","contrast"],
-  "colorScheme":     "string or null",
-  "targetAudience":  "string or null",
-  "specificRequests":"string or null"
+  "style":            "dark-modern|minimal|bold|corporate|playful|luxury|other",
+  "priority":         "conversions|aesthetics|mobile-ux|accessibility|all",
+  "priorityLaws":     ["fitts","hicks","gestalt","fpattern","hierarchy","typography","contrast"],
+  "colorScheme":      "string or null",
+  "targetAudience":   "string or null",
+  "specificRequests": "string or null"
 }`
     ),
     new HumanMessage(text),
   ]);
 
   const prefs = safeParseJSON(result.content, {
-    style: 'modern',
-    priority: 'all',
+    style: 'modern', priority: 'all',
     priorityLaws: ['fitts', 'hicks', 'gestalt'],
   });
 
@@ -206,10 +223,10 @@ async function designPreferenceNode(state) {
 
   const laws = prefs.priorityLaws?.join(', ') ?? 'all design laws';
   return {
-    design_preferences:     prefs,
+    design_preferences: prefs,
     design_prefs_collected: true,
-    next_node:              'benchmark_rag',
-    current_stage:          'fetching_benchmarks',
+    next_node: 'benchmark_rag',
+    current_stage: 'fetching_benchmarks',
     messages: [new AIMessage(
       `Got it! Focusing on **${prefs.style}** style with **${prefs.priority}** priority.\n` +
       `Applying: **${laws}**\n\nFetching top benchmark sites and your heatmap data now…`
@@ -219,18 +236,22 @@ async function designPreferenceNode(state) {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // AGENT 4 — Benchmark RAG
-// Retrieves top-performing sites in the same category via vector search.
 // ══════════════════════════════════════════════════════════════════════════════
 async function benchmarkRagNode(state) {
-  const writer = state._sseWriter;
-  emit(writer, 'stage', { stage: 'fetching_benchmarks', message: 'Finding benchmark sites…', progress: 35 });
+  const threadId = state.thread_id;
+  sse.emit(threadId, 'stage', { stage: 'fetching_benchmarks', message: 'Finding benchmark sites…', progress: 35 });
 
   try {
-    const benchmarks = await vectorSearch.searchBenchmarks({
-      siteType:    state.site_type,
+    const rawBenchmarks = await vectorSearch.searchBenchmarks({
+      siteType: state.site_type,
       designStyle: state.design_preferences?.style,
-      topK:        5,
+      topK: 5,
     });
+
+    // Re-rank benchmarks based on user's learned preferences
+    const benchmarks = state.user_id
+      ? await recTool.rankBenchmarksForUser(state.user_id, rawBenchmarks)
+      : rawBenchmarks;
 
     const lines = benchmarks.map((b, i) =>
       `${i + 1}. **${b.name}** (${b.url})\n   ${b.description}\n   Design strengths: ${b.design_notes}`
@@ -241,119 +262,141 @@ async function benchmarkRagNode(state) {
       `${lines.join('\n\n')}\n\n` +
       `Common patterns: ${benchmarks.flatMap(b => b.tags ?? []).join(', ')}`;
 
-    emit(writer, 'stage', { stage: 'benchmarks_ready', progress: 42 });
+    sse.emit(threadId, 'stage', { stage: 'benchmarks_ready', progress: 42 });
 
     return {
-      benchmark_sites:   benchmarks,
+      benchmark_sites: benchmarks,
       benchmark_context: benchmarkContext,
-      next_node:         'heatmap_analyzer',
+      next_node: 'heatmap_analyzer',
     };
   } catch (err) {
     console.error('Benchmark RAG error:', err.message);
     return {
-      benchmark_context: `No benchmark data available. Analysing against general best practices.`,
-      next_node:         'heatmap_analyzer',
+      benchmark_context: 'No benchmark data available. Analysing against general best practices.',
+      next_node: 'heatmap_analyzer',
     };
   }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // AGENT 5 — Heatmap Analyzer
-// Loads heatmap summary data for each page and builds NLP context for injection.
 // ══════════════════════════════════════════════════════════════════════════════
 async function heatmapAnalyzerNode(state) {
-  const writer   = state._sseWriter;
-  const pageKeys = Object.keys(state.scraped_pages);
-  emit(writer, 'stage', { stage: 'analyzing_heatmaps', message: 'Loading heatmap data…', progress: 50 });
+  const threadId = state.thread_id;
+  const pageKeys = Object.keys(state.scraped_pages ?? {});
+
+  sse.emit(threadId, 'stage', { stage: 'analyzing_heatmaps', message: 'Loading heatmap data…', progress: 50 });
 
   const heatmapData = {};
 
   for (const pageKey of pageKeys) {
-    const { rows } = await pool.query(
-      'SELECT * FROM heatmap_summaries WHERE site_url=$1 AND page_key=$2',
-      [state.site_url, pageKey]
-    );
+    const pageData = state.scraped_pages[pageKey];
 
-    if (rows.length > 0) {
-      const h = rows[0];
+    // 1. Try to get real aggregated heatmap data
+    let existing = await heatmapTool.getHeatmap(state.site_url, pageKey);
+
+    // 2. If none exists, generate AI-predicted heatmap from screenshot
+    if (!existing) {
+      sse.emit(threadId, 'stage', {
+        stage: 'predicting_heatmap',
+        message: `Predicting attention zones for ${pageKey}…`,
+        progress: 51,
+      });
+      try {
+        await heatmapTool.predictHeatmap(
+          state.site_url, pageKey,
+          pageData?.screenshot_url, pageData?.dom_summary
+        );
+        existing = await heatmapTool.getHeatmap(state.site_url, pageKey);
+      } catch (err) {
+        console.warn('Heatmap prediction error:', err.message);
+      }
+    }
+
+    if (existing) {
+      const isReal = !existing.predicted;
+      const hotZoneDesc = (existing.hot_zones ?? [])
+        .slice(0, 3)
+        .map(z => `${z.label}@(${Math.round(z.x * 100)}%,${Math.round(z.y * 100)}%) score:${z.score}`)
+        .join(', ');
+
       heatmapData[pageKey] = {
-        raw:           h,
-        context:       h.summary_text,
-        confidence:    h.confidence_level,
-        session_count: h.session_count,
+        raw: existing,
+        context: existing.summary_text ?? 'Heatmap data available.',
+        confidence: existing.confidence_level ?? (isReal ? 'low' : 'none'),
+        session_count: existing.session_count ?? 0,
+        predicted: !isReal,
+        hot_zones: existing.hot_zones ?? [],
+        above_fold_pct: existing.above_fold_pct ?? null,
+        grid: existing.grid_data ?? null,
+        hot_zone_desc: hotZoneDesc,
       };
     } else {
       heatmapData[pageKey] = {
-        raw:           null,
-        context:       `No heatmap data yet for ${pageKey}. Recommendations based on design principles only.`,
-        confidence:    'none',
+        raw: null,
+        context: `No heatmap data yet for ${pageKey}. Using design-law predictions only.`,
+        confidence: 'none',
         session_count: 0,
+        predicted: false,
+        hot_zones: [],
       };
     }
   }
 
-  const lines = Object.entries(heatmapData).map(([pk, h]) =>
-    `**${pk}** (${h.confidence} confidence, ${h.session_count} sessions): ${h.context}`
-  );
+  // Build rich context string for the AI chatbot
+  const lines = Object.entries(heatmapData).map(([pk, h]) => {
+    const dataType = h.session_count > 0 ? `${h.session_count} real sessions` : (h.predicted ? 'AI-predicted' : 'no data');
+    const foldInfo = h.above_fold_pct != null ? `, ${h.above_fold_pct}% above-fold attention` : '';
+    const hotInfo = h.hot_zone_desc ? `, hot zones: ${h.hot_zone_desc}` : '';
+    return `**${pk}** (${dataType}${foldInfo}${hotInfo}): ${h.context}`;
+  });
 
   const heatmapContext = lines.length > 0
-    ? `REAL USER ATTENTION DATA:\n\n${lines.join('\n\n')}\n\n` +
-      `⚠️ Heatmap guidance: Place high-priority CTAs and key content in hot zones. ` +
-      `Balance attention placement with overall aesthetic — do not disrupt visual harmony.`
+    ? `USER ATTENTION DATA (time-weighted — first 3s = 4× priority):\n\n${lines.join('\n\n')}\n\n` +
+      `⚠️ Place CTAs/key content in identified hot zones. First-3-second attention = highest conversion potential.`
     : 'No heatmap data available. Using design-law predictions only.';
 
-  emit(writer, 'stage', { stage: 'heatmaps_loaded', progress: 55 });
+  sse.emit(threadId, 'stage', { stage: 'heatmaps_loaded', progress: 55 });
 
   return {
-    heatmap_data:    heatmapData,
+    heatmap_data: heatmapData,
     heatmap_context: heatmapContext,
-    next_node:       'page_analyzer',
   };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // AGENT 6 — Per-Page Analyzer
-// Scores each page individually, then runs cross-page comparison.
 // ══════════════════════════════════════════════════════════════════════════════
 async function pageAnalyzerNode(state) {
-  const writer     = state._sseWriter;
-  const pages      = state.pages_to_analyze ?? [];
+  const threadId = state.thread_id;
+  const pages = state.pages_to_analyze ?? [];
   const pageAnalyses = { ...state.page_analyses };
 
   if (pages.length === 0) {
     return { next_node: 'code_enhancer', current_stage: 'enhancing_code' };
   }
 
-  // ── Analyse each page individually ──────────────────────────────────────────
   for (let i = 0; i < pages.length; i++) {
-    const pageKey  = pages[i];
+    const pageKey = pages[i];
     const pageData = state.scraped_pages[pageKey];
     if (!pageData) continue;
 
     const progress = 55 + Math.round((i / pages.length) * 25);
-    emit(writer, 'stage', {
+    sse.emit(threadId, 'stage', {
       stage: 'analyzing_pages',
       message: `Analysing ${pageKey} (${i + 1}/${pages.length})…`,
       progress,
       current_page: pageKey,
     });
 
-    const prompt = buildPageAnalysisPrompt({ pageKey, pageData, state });
-
-    const result = await llm.invoke([
+    const result = await getLLM().invoke([
       new SystemMessage(PAGE_ANALYSIS_SYSTEM),
-      new HumanMessage(prompt),
+      new HumanMessage(buildPageAnalysisPrompt({ pageKey, pageData, state })),
     ]);
 
-    const analysis = safeParseJSON(result.content, {
-      scores:          {},
-      critique:        result.content,
-      recommendations: [],
-    });
-
+    const analysis = safeParseJSON(result.content, { scores: {}, critique: result.content, recommendations: [] });
     pageAnalyses[pageKey] = analysis;
 
-    // Save to DB
     if (state.session_id) {
       await pool.query(
         `INSERT INTO design_analyses
@@ -362,169 +405,134 @@ async function pageAnalyzerNode(state) {
             score_hierarchy, score_typography, score_contrast, score_overall,
             critique_text, recommendations, heatmap_insights)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-         ON CONFLICT DO NOTHING`,
+         ON CONFLICT (session_id, page_key) DO UPDATE
+           SET score_fitts=$3, score_hicks=$4, score_gestalt=$5, score_fpattern=$6,
+               score_hierarchy=$7, score_typography=$8, score_contrast=$9, score_overall=$10,
+               critique_text=$11, recommendations=$12, heatmap_insights=$13`,
         [
           state.session_id, pageKey,
-          analysis.scores?.fitts,      analysis.scores?.hicks,
-          analysis.scores?.gestalt,    analysis.scores?.fpattern,
-          analysis.scores?.hierarchy,  analysis.scores?.typography,
-          analysis.scores?.contrast,   analysis.scores?.overall,
-          analysis.critique,
-          JSON.stringify(analysis.recommendations ?? []),
+          analysis.scores?.fitts, analysis.scores?.hicks, analysis.scores?.gestalt, analysis.scores?.fpattern,
+          analysis.scores?.hierarchy, analysis.scores?.typography, analysis.scores?.contrast, analysis.scores?.overall,
+          analysis.critique, JSON.stringify(analysis.recommendations ?? []),
           state.heatmap_data?.[pageKey]?.context,
         ]
       );
+      // Update page ranking with new design scores
+      await recTool.updatePageRanking(
+        state.site_url, pageKey, state.site_type,
+        analysis.scores, state.heatmap_data?.[pageKey]?.raw
+      ).catch(err => console.warn('Page ranking update error:', err.message));
     }
   }
 
-  // ── Cross-page consistency check ─────────────────────────────────────────────
-  emit(writer, 'stage', { stage: 'cross_page_check', message: 'Checking cross-page consistency…', progress: 82 });
+  sse.emit(threadId, 'stage', { stage: 'cross_page_check', message: 'Checking cross-page consistency…', progress: 82 });
 
   const pageSummaries = Object.entries(pageAnalyses)
-    .map(([pk, a]) =>
-      `**${pk}**: CTA="${a.cta_style ?? '?'}", nav=${a.nav_present ?? '?'}, ` +
-      `color="${a.primary_color ?? '?'}", font="${a.font_system ?? '?'}"`
-    )
+    .map(([pk, a]) => `**${pk}**: CTA="${a.cta_style ?? '?'}", color="${a.primary_color ?? '?'}", font="${a.font_system ?? '?'}"`)
     .join('\n');
 
-  const crossResult = await llm.invoke([
-    new SystemMessage(
-      'Identify design inconsistencies ACROSS pages. ' +
-      'Return ONLY JSON: { "discrepancies": [{ "type": string, "pages": string[], "severity": "high|medium|low", "description": string, "fix": string }] }'
-    ),
+  const crossResult = await getLLM().invoke([
+    new SystemMessage('Identify design inconsistencies ACROSS pages. Return ONLY JSON: { "discrepancies": [{ "type": string, "pages": string[], "severity": "high|medium|low", "description": string, "fix": string }] }'),
     new HumanMessage(`Site: ${state.site_url} (${state.site_type})\n\n${pageSummaries}`),
   ]);
 
   const discrepancies = safeParseJSON(crossResult.content, { discrepancies: [] });
 
-  // Build response summary
-  const scoresSummary = Object.entries(pageAnalyses)
-    .map(([pk, a]) => `**${pk}** — ${a.scores?.overall ?? '?'}/100`)
-    .join(' · ');
-
+  const scoresSummary = Object.entries(pageAnalyses).map(([pk, a]) => `**${pk}** — ${a.scores?.overall ?? '?'}/100`).join(' · ');
   const topRecs = Object.entries(pageAnalyses)
-    .flatMap(([pk, a]) =>
-      (a.recommendations ?? []).slice(0, 2).map(r => `• **${pk}** — ${r.title} _(${r.impact} impact)_`)
-    )
+    .flatMap(([pk, a]) => (a.recommendations ?? []).slice(0, 2).map(r => `• **${pk}** — ${r.title} _(${r.impact} impact)_`))
     .slice(0, 6);
 
   return {
-    page_analyses:            pageAnalyses,
+    page_analyses: pageAnalyses,
     cross_page_discrepancies: discrepancies,
-    pages_to_analyze:         [],
-    next_node:                'code_enhancer',
-    current_stage:            'enhancing_code',
+    pages_to_analyze: [],
+    next_node: 'code_enhancer',
+    current_stage: 'enhancing_code',
     messages: [new AIMessage(
-      `📊 **Design Analysis Complete**\n\n` +
-      `**Scores:** ${scoresSummary}\n\n` +
+      `📊 **Design Analysis Complete**\n\n**Scores:** ${scoresSummary}\n\n` +
       `**${discrepancies.discrepancies?.length ?? 0} cross-page inconsistencies found**\n\n` +
-      `**Top Recommendations:**\n${topRecs.join('\n')}\n\n` +
-      `Generating enhanced HTML/CSS for each page…`
+      `**Top Recommendations:**\n${topRecs.join('\n')}\n\nGenerating enhanced HTML/CSS for each page…`
     )],
   };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // AGENT 7 — Code Enhancer
-// Generates improved HTML/CSS for each page using analysis + heatmap context.
 // ══════════════════════════════════════════════════════════════════════════════
 async function codeEnhancerNode(state) {
-  const writer = state._sseWriter;
-  const pages  = Object.keys(state.scraped_pages);
+  const threadId = state.thread_id;
+  const pages = Object.keys(state.scraped_pages ?? {});
   const enhanced = { ...state.enhanced_pages };
 
   for (let i = 0; i < pages.length; i++) {
-    const pageKey  = pages[i];
+    const pageKey = pages[i];
     const pageData = state.scraped_pages[pageKey];
     const analysis = state.page_analyses[pageKey];
     if (!pageData || !analysis) continue;
 
     const progress = 85 + Math.round((i / pages.length) * 12);
-    emit(writer, 'stage', {
-      stage: 'enhancing_code',
-      message: `Enhancing ${pageKey}…`,
-      progress,
-      current_page: pageKey,
-    });
+    sse.emit(threadId, 'stage', { stage: 'enhancing_code', message: `Enhancing ${pageKey}…`, progress, current_page: pageKey });
 
-    const prompt = buildEnhancementPrompt({ pageKey, pageData, analysis, state });
-
-    const result = await llm.invoke([
+    const result = await getLLM().invoke([
       new SystemMessage(CODE_ENHANCEMENT_SYSTEM),
-      new HumanMessage(prompt),
+      new HumanMessage(buildEnhancementPrompt({ pageKey, pageData, analysis, state })),
     ]);
 
-    const enhancedPage = safeParseJSON(result.content, {
-      html:         result.content,
-      css:          '',
-      diff_summary: 'Enhancement applied.',
-      changes:      [],
-    });
-
+    const enhancedPage = safeParseJSON(result.content, { html: result.content, css: '', diff_summary: 'Enhancement applied.', changes: [] });
     enhanced[pageKey] = enhancedPage;
 
-    // Persist
     if (state.session_id) {
       await pool.query(
-        `UPDATE design_analyses
-         SET enhanced_html=$1, enhanced_css=$2, diff_summary=$3
-         WHERE session_id=$4 AND page_key=$5`,
+        `UPDATE design_analyses SET enhanced_html=$1, enhanced_css=$2, diff_summary=$3 WHERE session_id=$4 AND page_key=$5`,
         [enhancedPage.html, enhancedPage.css, enhancedPage.diff_summary, state.session_id, pageKey]
       );
+      // Record improvement delta for ranking
+      const beforeScore = state.page_analyses?.[pageKey]?.scores?.overall ?? 0;
+      const afterScore  = enhancedPage.after_score ?? beforeScore + 15; // estimated +15 if not provided
+      await recTool.recordImprovement(state.site_url, pageKey, beforeScore, afterScore)
+        .catch(err => console.warn('Improvement delta error:', err.message));
     }
   }
 
-  const pageList = pages.map(pk => `• **${pk}** — enhanced HTML + CSS ready`).join('\n');
-  emit(writer, 'stage', { stage: 'done', progress: 100 });
+  sse.emit(threadId, 'stage', { stage: 'done', progress: 100 });
 
   return {
     enhanced_pages: enhanced,
-    next_node:      'done',
-    current_stage:  'done',
+    current_stage: 'done',
     stage_progress: 100,
     messages: [new AIMessage(
-      `✨ **Enhancement Complete!**\n\n${pageList}\n\n` +
-      `You can now:\n` +
-      `• **Download** the enhanced HTML/CSS per page from the Analysis Panel\n` +
-      `• **Ask me to refine** anything: _"Make the homepage CTA more prominent"_\n` +
-      `• **Compare** before/after with the diff view\n\n` +
-      `What would you like to do next?`
+      `✨ **Enhancement Complete!**\n\n${pages.map(pk => `• **${pk}** — enhanced HTML + CSS ready`).join('\n')}\n\n` +
+      `You can now:\n• **Download** the enhanced HTML/CSS per page from the Analysis Panel\n` +
+      `• **Ask me to refine** anything: _"Make the homepage CTA more prominent"_`
     )],
   };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // AGENT 8 — General Chat
-// Handles all non-analysis messages with full session context.
 // ══════════════════════════════════════════════════════════════════════════════
 async function generalChatNode(state) {
-  const writer  = state._sseWriter;
-  const last    = state.messages[state.messages.length - 1];
-  const userMsg = typeof last.content === 'string' ? last.content : '';
+  const threadId = state.thread_id;
+  const last = state.messages[state.messages.length - 1];
+  const userMsg = typeof last?.content === 'string' ? last.content : '';
 
-  // Build session context summary
   const ctx = [];
   if (state.site_url) ctx.push(`Current site: ${state.site_url} (${state.site_type})`);
-  if (Object.keys(state.scraped_pages).length > 0)
+  if (Object.keys(state.scraped_pages ?? {}).length > 0)
     ctx.push(`Scraped pages: ${Object.keys(state.scraped_pages).join(', ')}`);
-  if (Object.keys(state.page_analyses).length > 0) {
-    const scores = Object.entries(state.page_analyses)
-      .map(([pk, a]) => `${pk}: ${a.scores?.overall ?? '?'}/100`)
-      .join(', ');
-    ctx.push(`Analysis scores: ${scores}`);
-  }
+  if (Object.keys(state.page_analyses ?? {}).length > 0)
+    ctx.push(`Analysis scores: ${Object.entries(state.page_analyses).map(([pk, a]) => `${pk}: ${a.scores?.overall ?? '?'}/100`).join(', ')}`);
   if (state.design_preferences?.style)
     ctx.push(`Design prefs: ${JSON.stringify(state.design_preferences)}`);
 
   const systemPrompt =
     `You are Aura AI, an expert UI/UX design assistant and frontend developer.\n` +
-    `You help website owners improve designs using: Hick's Law, Fitts's Law, Gestalt Principles,\n` +
-    `F-Pattern, Visual Hierarchy, Rule of Thirds, and Miller's Law.\n` +
+    `You help website owners improve designs using: Hick's Law, Fitts's Law, Gestalt Principles, F-Pattern, Visual Hierarchy, Rule of Thirds, Miller's Law.\n` +
     (ctx.length > 0 ? `\nCURRENT SESSION:\n${ctx.join('\n')}\n` : '') +
     `\nBe conversational, specific, and actionable. Format responses with markdown.`;
 
-  // Stream tokens to SSE
-  const stream = await llm.stream([
+  const stream = await getLLM().stream([
     new SystemMessage(systemPrompt),
     ...state.messages.slice(-10),
     new HumanMessage(userMsg),
@@ -534,11 +542,11 @@ async function generalChatNode(state) {
   for await (const chunk of stream) {
     const token = chunk.content ?? '';
     full += token;
-    emit(writer, 'token', { token });
+    sse.emit(threadId, 'token', { token });
   }
 
   return {
-    messages:      [new AIMessage(full)],
+    messages: [new AIMessage(full)],
     current_stage: 'idle',
   };
 }
@@ -548,17 +556,14 @@ async function generalChatNode(state) {
 // ══════════════════════════════════════════════════════════════════════════════
 
 function buildPageAnalysisPrompt({ pageKey, pageData, state }) {
-  const topLaws = state.design_preferences?.priorityLaws?.join(', ') ?? 'all';
   return `
 PAGE: ${pageKey} (${pageData.page_type ?? 'unknown'})
 URL: ${pageData.page_url}
 SITE TYPE: ${state.site_type}
-DESIGN GOALS: style=${state.design_preferences?.style ?? 'any'}, priority=${state.design_preferences?.priority ?? 'all'}, laws=${topLaws}
+DESIGN GOALS: style=${state.design_preferences?.style ?? 'any'}, priority=${state.design_preferences?.priority ?? 'all'}, laws=${state.design_preferences?.priorityLaws?.join(', ') ?? 'all'}
 
 ${state.benchmark_context ? `\n${state.benchmark_context}\n` : ''}
-${state.heatmap_data?.[pageKey]?.context
-  ? `\nREAL USER HEATMAP DATA:\n${state.heatmap_data[pageKey].context}\n`
-  : ''}
+${state.heatmap_data?.[pageKey]?.context ? `\nREAL USER HEATMAP DATA:\n${state.heatmap_data[pageKey].context}\n` : ''}
 
 DOM SUMMARY:
 ${pageData.dom_summary ?? pageData.html?.substring(0, 3000) ?? 'No data'}
@@ -566,7 +571,7 @@ ${pageData.dom_summary ?? pageData.html?.substring(0, 3000) ?? 'No data'}
 Return ONLY this JSON:
 {
   "scores": { "fitts":0-100, "hicks":0-100, "gestalt":0-100, "fpattern":0-100, "hierarchy":0-100, "typography":0-100, "contrast":0-100, "overall":0-100 },
-  "critique": "3-4 sentence expert critique referencing specific evidence from the DOM",
+  "critique": "3-4 sentence expert critique referencing specific DOM evidence",
   "cta_style": "description of CTA button style",
   "nav_present": true/false,
   "primary_color": "#hex or description",
@@ -578,24 +583,20 @@ Return ONLY this JSON:
 }
 
 function buildEnhancementPrompt({ pageKey, pageData, analysis, state }) {
-  const highImpact   = (analysis.recommendations ?? []).filter(r => r.impact === 'high').slice(0, 5);
-  const crossFixes   = (state.cross_page_discrepancies?.discrepancies ?? [])
-    .filter(d => d.pages?.includes(pageKey)).slice(0, 3);
+  const highImpact = (analysis.recommendations ?? []).filter(r => r.impact === 'high').slice(0, 5);
+  const crossFixes = (state.cross_page_discrepancies?.discrepancies ?? []).filter(d => d.pages?.includes(pageKey)).slice(0, 3);
 
   return `
 PAGE: ${pageKey}
-STYLE: ${state.design_preferences?.style ?? 'modern'}
-PRIORITY: ${state.design_preferences?.priority ?? 'all'}
+STYLE: ${state.design_preferences?.style ?? 'modern'}, PRIORITY: ${state.design_preferences?.priority ?? 'all'}
 
 HIGH-IMPACT FIXES:
-${highImpact.map((r, i) => `${i+1}. [${r.law}] ${r.description} → ${r.fix_hint}`).join('\n') || 'None'}
+${highImpact.map((r, i) => `${i + 1}. [${r.law}] ${r.description} → ${r.fix_hint}`).join('\n') || 'None'}
 
 CROSS-PAGE CONSISTENCY FIXES:
 ${crossFixes.map(d => `- ${d.type}: ${d.fix}`).join('\n') || 'None'}
 
-${state.heatmap_data?.[pageKey]?.context
-  ? `\nHEATMAP GUIDANCE:\n${state.heatmap_data[pageKey].context}\n`
-  : ''}
+${state.heatmap_data?.[pageKey]?.context ? `\nHEATMAP GUIDANCE:\n${state.heatmap_data[pageKey].context}\n` : ''}
 
 ORIGINAL HTML (first 4000 chars):
 ${(pageData.html ?? '').substring(0, 4000)}
@@ -612,25 +613,19 @@ Return ONLY this JSON:
 }`;
 }
 
-// ── System prompts ─────────────────────────────────────────────────────────────
-
 const PAGE_ANALYSIS_SYSTEM =
   `You are a world-class UI/UX design expert and CRO specialist.
 Analyse web pages against: Hick's Law, Fitts's Law, Gestalt Principles, F-Pattern, Visual Hierarchy, Rule of Thirds, Miller's Law.
-Rules: Score honestly (85+ = genuinely excellent). Base findings on DOM evidence, not generic advice.
-When heatmap data is provided, weight your findings accordingly — behavioural data > theory.
+Score honestly (85+ = genuinely excellent). Base findings on DOM evidence.
+When heatmap data is provided, weight findings accordingly — behavioural data > theory.
 Output ONLY valid JSON. No commentary outside the JSON.`;
 
 const CODE_ENHANCEMENT_SYSTEM =
   `You are a senior frontend developer and UI/UX engineer.
 Enhance HTML/CSS to apply design-law recommendations while preserving the site's brand identity.
-Rules:
-1. PRESERVE brand identity, colours, and personality — only improve structure and layout
-2. Apply Tailwind CSS utility classes where applicable (assume CDN is available)
-3. Respect heatmap data — place CTAs and key content in high-attention zones
-4. Fix cross-page inconsistencies (nav, typography, CTA styles)
-5. Changes should be surgical — fix the issues, don't rewrite the whole page
-6. Output ONLY valid JSON. No commentary outside the JSON.`;
+Rules: PRESERVE brand/colours/personality. Apply Tailwind where applicable (CDN available).
+Respect heatmap data for CTA placement. Fix cross-page inconsistencies. Be surgical.
+Output ONLY valid JSON. No commentary outside the JSON.`;
 
 module.exports = {
   orchestratorNode,

@@ -16,6 +16,9 @@ const AuraGraphState = Annotation.Root({
   thread_id:  Annotation({ reducer: (x, y) => y ?? x, default: () => null }),
   user_id:    Annotation({ reducer: (x, y) => y ?? x, default: () => null }),
 
+  // ── User preference profile (loaded at session start) ─────────
+  user_profile: Annotation({ reducer: (x, y) => y ?? x, default: () => null }),
+
   // ── Routing ───────────────────────────────────────────────────
   next_node: Annotation({ reducer: (x, y) => y ?? x, default: () => 'orchestrator' }),
   intent:    Annotation({

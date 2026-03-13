@@ -24,6 +24,24 @@ app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 // ── Routes ─────────────────────────────────────────────────────────────────────
 app.use('/auth', require('./routes/auth.routes'));
 app.use('/chat', require('./routes/chat.routes'));
+app.use('/heatmap', require('./routes/heatmap.routes'));
+app.use('/recommendations', require('./routes/recommendation.routes'));
+
+// Root route
+app.get('/', (_req, res) => {
+  res.json({
+    name: 'Aura Design AI Backend',
+    status: '🟢 running',
+    version: '1.0.0',
+    endpoints: {
+      health:          'GET /health',
+      auth:            'POST /auth/register | POST /auth/login',
+      chat:            'POST /chat/session | POST /chat/message | GET /chat/history/:sessionId',
+      heatmap:         'POST /heatmap/survey | POST /heatmap/predict | GET /heatmap/:pageKey',
+      recommendations: 'POST /recommendations/track | GET /recommendations/pages | GET /recommendations/profile',
+    }
+  });
+});
 
 // Health check
 app.get('/health', (_req, res) => {
@@ -39,7 +57,7 @@ app.use((err, _req, res, _next) => {
 // ── Boot ───────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT ?? 3001;
 
-async function start() {
+async function start(port = PORT) {
   try {
     // Boot DB first
     require('./db/pool');
@@ -48,10 +66,22 @@ async function start() {
     const { getGraph } = require('./graph/auraGraph');
     await getGraph();
 
-    app.listen(PORT, () => {
-      console.log(`\n✅ Aura Backend running → http://localhost:${PORT}`);
+    const server = app.listen(port, () => {
+      console.log(`\n✅ Aura Backend running → http://localhost:${port}`);
       console.log(`   Environment: ${process.env.NODE_ENV}`);
       console.log(`   CORS origin: ${process.env.FRONTEND_URL ?? 'http://localhost:5173'}\n`);
+    });
+
+    // If port is busy, auto-retry on next port
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.warn(`⚠️  Port ${port} in use — retrying on ${port + 1}…`);
+        server.close();
+        start(port + 1);
+      } else {
+        console.error('Server error:', err.message);
+        process.exit(1);
+      }
     });
   } catch (err) {
     console.error('Startup failed:', err.message);

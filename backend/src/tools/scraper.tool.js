@@ -1,20 +1,29 @@
 // src/tools/scraper.tool.js
 // Headless Puppeteer scraper — scrapes DOM, CSS, screenshot per page
 
+// dotenv MUST be first — before any process.env access
+require('dotenv').config();
+
 const puppeteer = require('puppeteer');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
 const { ChatGoogleGenerativeAI } = require('@langchain/google-genai');
 const { HumanMessage, SystemMessage } = require('@langchain/core/messages');
-require('dotenv').config();
 
-const llm = new ChatGoogleGenerativeAI({
-  model: 'gemini-1.5-flash',
-  apiKey: process.env.GEMINI_API_KEY,
-  temperature: 0,
-  maxOutputTokens: 1500,
-});
+// Lazy LLM — created on first use so GEMINI_API_KEY is always loaded
+let _llm = null;
+function getLLM() {
+  if (!_llm) {
+    _llm = new ChatGoogleGenerativeAI({
+      model: 'gemini-1.5-flash',
+      apiKey: process.env.GEMINI_API_KEY,
+      temperature: 0,
+      maxOutputTokens: 1500,
+    });
+  }
+  return _llm;
+}
 
 // Uploads directory for screenshots
 const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
@@ -25,14 +34,14 @@ if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 function classifyPage(url) {
   const p = new URL(url).pathname.toLowerCase();
   if (p === '/' || p === '' || p === '/home') return 'homepage';
-  if (p.includes('/product') || p.includes('/item'))        return 'product';
+  if (p.includes('/product') || p.includes('/item')) return 'product';
   if (p.includes('/category') || p.includes('/collection')) return 'category';
-  if (p.includes('/cart') || p.includes('/basket'))         return 'cart';
-  if (p.includes('/checkout'))                              return 'checkout';
-  if (p.includes('/pricing'))                               return 'pricing';
-  if (p.includes('/about'))                                 return 'about';
-  if (p.includes('/contact'))                               return 'contact';
-  if (p.includes('/blog'))                                  return 'blog';
+  if (p.includes('/cart') || p.includes('/basket')) return 'cart';
+  if (p.includes('/checkout')) return 'checkout';
+  if (p.includes('/pricing')) return 'pricing';
+  if (p.includes('/about')) return 'about';
+  if (p.includes('/contact')) return 'contact';
+  if (p.includes('/blog')) return 'blog';
   return 'other';
 }
 
@@ -61,7 +70,7 @@ async function extractCSS(page) {
 async function compressDom(html, url) {
   if (!html || html.length < 300) return html ?? '';
   try {
-    const result = await llm.invoke([
+    const result = await getLLM().invoke([
       new SystemMessage(
         'Extract a compact DOM summary for design analysis. Include: ' +
         'page title, H1-H3 headings, CTA buttons (text + classes), nav links, ' +
@@ -72,7 +81,6 @@ async function compressDom(html, url) {
     ]);
     return result.content;
   } catch {
-    // Fallback: strip tags
     return html
       .replace(/<script[\s\S]*?<\/script>/gi, '')
       .replace(/<style[\s\S]*?<\/style>/gi, '')
@@ -93,41 +101,39 @@ async function scrapeSinglePage(browser, url) {
 
     await page.setRequestInterception(true);
     page.on('request', (req) => {
-      // Block fonts & media to speed up scrape
       if (['font', 'media'].includes(req.resourceType())) req.abort();
       else req.continue();
     });
 
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-    await new Promise(r => setTimeout(r, 600)); // small buffer for deferred renders
+    await new Promise(r => setTimeout(r, 600));
 
-    const html         = await page.content();
-    const css          = await extractCSS(page);
-    const pageTitle    = await page.title();
+    const html = await page.content();
+    const css = await extractCSS(page);
+    const pageTitle = await page.title();
     const elementCount = await page.$$eval('*', els => els.length);
-    const hasCta       = await page.$$eval(
+    const hasCta = await page.$$eval(
       'button, a[class*="btn"], a[class*="cta"], [class*="button"]',
       els => els.length > 0
     );
 
-    // Screenshot (viewport only — faster than fullPage)
-    const ssId   = uuidv4();
+    const ssId = uuidv4();
     const ssPath = path.join(UPLOADS_DIR, `${ssId}.png`);
     await page.screenshot({ path: ssPath, fullPage: false });
 
     const domSummary = await compressDom(html, url);
 
     return {
-      page_url:       url,
-      page_key:       normalizePageKey(url),
-      page_type:      classifyPage(url),
-      page_title:     pageTitle,
-      html:           html.substring(0, 50000),
-      css:            css.substring(0, 5000),
-      dom_summary:    domSummary,
+      page_url: url,
+      page_key: normalizePageKey(url),
+      page_type: classifyPage(url),
+      page_title: pageTitle,
+      html: html.substring(0, 50000),
+      css: css.substring(0, 5000),
+      dom_summary: domSummary,
       screenshot_url: `/uploads/${ssId}.png`,
-      element_count:  elementCount,
-      has_cta:        hasCta,
+      element_count: elementCount,
+      has_cta: hasCta,
     };
   } finally {
     await page.close();
@@ -149,12 +155,11 @@ async function discoverPages(browser, rootUrl, maxPages = 5) {
       baseHost
     );
 
-    // Priority pages first
     const priority = links.filter(u => {
       const p = u.toLowerCase();
       return p.includes('/product') || p.includes('/pricing') ||
-             p.includes('/about')   || p.includes('/shop')    ||
-             p.includes('/contact') || p.includes('/category');
+        p.includes('/about') || p.includes('/shop') ||
+        p.includes('/contact') || p.includes('/category');
     });
 
     for (const u of [...priority, ...links]) {
@@ -193,18 +198,12 @@ async function scrapeWebsite(rootUrl, options = {}) {
 
     const results = {};
 
-    // Process in chunks of 3 in parallel
     for (let i = 0; i < pageUrls.length; i += 3) {
       const chunk = pageUrls.slice(i, i + 3);
-      const settled = await Promise.allSettled(
-        chunk.map(url => scrapeSinglePage(browser, url))
-      );
+      const settled = await Promise.allSettled(chunk.map(url => scrapeSinglePage(browser, url)));
       for (const r of settled) {
-        if (r.status === 'fulfilled') {
-          results[r.value.page_key] = r.value;
-        } else {
-          console.warn('  Page scrape failed:', r.reason?.message);
-        }
+        if (r.status === 'fulfilled') results[r.value.page_key] = r.value;
+        else console.warn('  Page scrape failed:', r.reason?.message);
       }
     }
 
