@@ -1,6 +1,20 @@
 // src/app.js
 // Express entry point — boots DB, LangGraph, and starts the server
 
+// ── Global safety nets — prevent unhandled async errors from crashing the server
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('⚠️  Unhandled Rejection (non-fatal):', reason?.message ?? reason);
+});
+process.on('uncaughtException', (err) => {
+  // Only crash on truly fatal errors, not Puppeteer / network failures
+  if (err.code === 'ERR_USE_AFTER_CLOSE' || err.message?.includes('Protocol error')) {
+    console.warn('⚠️  Browser protocol error (non-fatal):', err.message);
+    return;
+  }
+  console.error('💥 Uncaught Exception:', err.message);
+  // Don't call process.exit — let the server keep running
+});
+
 require('dotenv').config();
 const express      = require('express');
 const cors         = require('cors');

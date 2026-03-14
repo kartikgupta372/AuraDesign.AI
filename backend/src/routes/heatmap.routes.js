@@ -15,7 +15,7 @@ require('dotenv').config();
 
 let _llm = null;
 function getLLM() {
-  if (!_llm) _llm = new ChatGoogleGenerativeAI({ model: 'gemini-2.0-flash', apiKey: process.env.GEMINI_API_KEY, temperature: 0 });
+  if (!_llm) _llm = new ChatGoogleGenerativeAI({ model: 'gemini-2.5-flash', apiKey: process.env.GEMINI_API_KEY, temperature: 0 });
   return _llm;
 }
 function safeJSON(t, fb = {}) {
@@ -28,23 +28,31 @@ router.post('/screenshot', authMiddleware, async (req, res) => {
   const { url, pageKey = 'homepage' } = req.body;
   if (!url) return res.status(400).json({ success: false, error: 'url required' });
   try {
+    // fullPage: true gives the long screenshot needed for heatmap surveys
     const pages = await scraper.scrapeWebsite(url, { maxPages: 1, fullPage: true });
     const homeKey = Object.keys(pages)[0];
-    if (!homeKey) return res.status(500).json({ success: false, error: 'Could not scrape page' });
+    if (!homeKey) return res.status(500).json({ success: false, error: 'Could not scrape page — the site may block bots, require login, or have slow JS rendering' });
     const page = pages[homeKey];
     res.json({
       success: true,
       data: {
-        screenshot_url:    page.screenshot_url,
-        page_key:          pageKey,
-        page_url:          page.page_url,
-        element_count:     page.element_count,
-        dom_summary:       page.dom_summary,
+        screenshot_url:  page.screenshot_url,
+        page_key:        pageKey || homeKey,
+        page_url:        page.page_url,
+        page_title:      page.page_title,
+        element_count:   page.element_count,
+        dom_summary:     page.dom_summary,
       }
     });
   } catch (err) {
     console.error('Screenshot error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    // Return friendly error without crashing
+    res.status(500).json({
+      success: false,
+      error: err.message.includes('timed out')
+        ? 'Screenshot timed out — the site may be slow or block automated browsers. Try a simpler URL.'
+        : `Screenshot failed: ${err.message}`
+    });
   }
 });
 
@@ -232,6 +240,51 @@ router.post('/bundle', authMiddleware, async (req, res) => {
     if (error) throw new Error(error.message);
     res.json({ success: true, data: { bundle, ai_summary: aiSummary } });
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// ── POST /heatmap/bundle/:bundleId/send-to-chat ───────────────────────────────
+// Create a chat session pre-loaded with bundle heatmap data for AI analysis
+router.post('/bundle/:bundleId/send-to-chat', authMiddleware, async (req, res) => {
+  try {
+    const { data: bundle, error } = await supabase.from('heatmap_bundles')
+      .select('*').eq('id', req.params.bundleId).eq('user_id', req.user.id).single();
+    if (error || !bundle) return res.status(404).json({ success: false, error: 'Bundle not found' });
+
+    const { v4: uuidv4 } = require('uuid');
+    const threadId = `aura_hm_${uuidv4()}`;
+
+    const { data: newSession, error: sessErr } = await supabase.from('chat_sessions').insert({
+      user_id:      req.user.id,
+      thread_id:    threadId,
+      title:        `Heatmap Analysis: ${bundle.bundle_name}`,
+      status:       'active',
+      site_url:     bundle.site_url,
+      design_prefs: JSON.stringify({ heatmap_bundle_id: bundle.id }),
+    }).select().single();
+
+    if (sessErr) throw new Error(sessErr.message);
+
+    // Auto-save first message with bundle context
+    const pagesSummary = bundle.bundle_data?.pages?.map(p =>
+      `• **${p.page_key}**: ${p.heatmap?.summary_text ?? 'No heatmap yet'}`
+    ).join('\n') ?? 'Bundle pages attached.';
+
+    const firstMsg = `Please analyse this heatmap bundle for ${bundle.site_url}:\n\n**${bundle.bundle_name}**\n\n${pagesSummary}\n\n**AI Summary:**\n${bundle.ai_summary ?? 'No summary yet.'}\n\nBased on this attention data, what are the key UX insights and what should I prioritise fixing?`;
+
+    await supabase.from('chat_messages').insert({
+      session_id:   newSession.id,
+      thread_id:    threadId,
+      role:         'user',
+      content:      firstMsg,
+      content_type: 'text',
+      metadata:     JSON.stringify({ source: 'heatmap_bundle', bundle_id: bundle.id }),
+    });
+
+    res.json({ success: true, data: { session: newSession, thread_id: threadId } });
+  } catch (err) {
+    console.error('Bundle to chat error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // ── GET /heatmap/bundles ──────────────────────────────────────────────────────

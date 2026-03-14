@@ -356,7 +356,7 @@ async function heatmapAnalyzerNode(state) {
 
   const heatmapContext = lines.length > 0
     ? `USER ATTENTION DATA (time-weighted — first 3s = 4× priority):\n\n${lines.join('\n\n')}\n\n` +
-      `⚠️ Place CTAs/key content in identified hot zones. First-3-second attention = highest conversion potential.`
+    `⚠️ Place CTAs/key content in identified hot zones. First-3-second attention = highest conversion potential.`
     : 'No heatmap data available. Using design-law predictions only.';
 
   sse.emit(threadId, 'stage', { stage: 'heatmaps_loaded', progress: 55 });
@@ -492,7 +492,7 @@ async function codeEnhancerNode(state) {
       );
       // Record improvement delta for ranking
       const beforeScore = state.page_analyses?.[pageKey]?.scores?.overall ?? 0;
-      const afterScore  = enhancedPage.after_score ?? beforeScore + 15; // estimated +15 if not provided
+      const afterScore = enhancedPage.after_score ?? beforeScore + 15; // estimated +15 if not provided
       await recTool.recordImprovement(state.site_url, pageKey, beforeScore, afterScore)
         .catch(err => console.warn('Improvement delta error:', err.message));
     }

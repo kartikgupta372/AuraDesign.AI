@@ -13,7 +13,7 @@ require('dotenv').config();
 
 let _llm = null;
 function getLLM() {
-  if (!_llm) _llm = new ChatGoogleGenerativeAI({ model: 'gemini-2.0-flash', apiKey: process.env.GEMINI_API_KEY, temperature: 0.3, maxOutputTokens: 4096 });
+  if (!_llm) _llm = new ChatGoogleGenerativeAI({ model: 'gemini-2.5-flash', apiKey: process.env.GEMINI_API_KEY, temperature: 0.3, maxOutputTokens: 4096 });
   return _llm;
 }
 function safeJSON(text, fb = []) {
@@ -175,64 +175,66 @@ Return ONLY this JSON array (no markdown):
 // On approve: creates a new chat session pre-loaded with the implementation task
 router.post('/cards/:cardId/action', authMiddleware, async (req, res) => {
   const { cardId } = req.params;
-  const { action } = req.body; // 'approve' | 'reject'
+  const { action } = req.body;
   if (!['approve','reject'].includes(action)) return res.status(400).json({ success: false, error: 'action must be approve or reject' });
 
   try {
-    // Fetch the card
     const { data: card, error: fetchErr } = await supabase
-      .from('recommendation_cards')
-      .select('*')
-      .eq('id', cardId)
-      .eq('user_id', req.user.id)
-      .single();
+      .from('recommendation_cards').select('*').eq('id', cardId).eq('user_id', req.user.id).single();
     if (fetchErr || !card) return res.status(404).json({ success: false, error: 'Card not found' });
 
     let agentSessionId = null;
+    let agentThreadId  = null;
 
     if (action === 'approve') {
-      // Create a pre-loaded chat session for the agent to implement this change
-      const { supabase: sb } = require('../db/pool');
       const { v4: uuidv4 } = require('uuid');
       const threadId = `aura_impl_${uuidv4()}`;
       const sessionTitle = `Implement: ${card.title.substring(0, 50)}`;
+      const task = {
+        card_id:        card.id,
+        title:          card.title,
+        description:    card.description,
+        change_type:    card.change_type,
+        element_target: card.element_target,
+        after_snippet:  card.after_snippet,
+        inspired_by:    card.inspired_by,
+        design_law:     card.design_law,
+      };
 
-      const { data: newSession, error: sessErr } = await sb
+      const { data: newSession, error: sessErr } = await supabase
         .from('chat_sessions')
         .insert({
-          user_id:    req.user.id,
-          thread_id:  threadId,
-          title:      sessionTitle,
-          status:     'active',
-          site_url:   card.site_url,
-          site_type:  card.site_type,
-          design_prefs: JSON.stringify({
-            implementation_task: {
-              card_id:        card.id,
-              title:          card.title,
-              description:    card.description,
-              change_type:    card.change_type,
-              element_target: card.element_target,
-              after_snippet:  card.after_snippet,
-              inspired_by:    card.inspired_by,
-              design_law:     card.design_law,
-            }
-          }),
+          user_id:      req.user.id,
+          thread_id:    threadId,
+          title:        sessionTitle,
+          status:       'active',
+          site_url:     card.site_url,
+          site_type:    card.site_type,
+          design_prefs: JSON.stringify({ implementation_task: task }),
         })
-        .select()
-        .single();
+        .select().single();
 
       if (sessErr) throw new Error(sessErr.message);
       agentSessionId = newSession.id;
+      agentThreadId  = threadId;
 
-      // Track as applied_fix interaction
+      // Auto-save the task as the first user message so chat opens ready
+      const firstMsg = `Please implement this design improvement for ${card.site_url}:\n\n**${card.title}**\n\n${card.description}\n\n**Target element:** ${card.element_target}\n**Change:** ${card.after_snippet}\n**Inspired by:** ${card.inspired_by}\n**Design law:** ${card.design_law}\n\nApply this change to the enhanced HTML/CSS.`;
+      await supabase.from('chat_messages').insert({
+        session_id:   newSession.id,
+        thread_id:    threadId,
+        role:         'user',
+        content:      firstMsg,
+        content_type: 'text',
+        metadata:     JSON.stringify({ source: 'recommendation_card', card_id: card.id }),
+      });
+
       await rec.trackInteraction(req.user.id, agentSessionId, {
         siteUrl: card.site_url, pageKey: card.page_key,
         actionType: 'applied_fix',
         actionData: { law: card.design_law, style: card.change_type, title: card.title },
       });
     } else {
-      // Track as dismissed
       await rec.trackInteraction(req.user.id, null, {
         siteUrl: card.site_url, pageKey: card.page_key,
         actionType: 'dismissed_fix',
@@ -240,14 +242,11 @@ router.post('/cards/:cardId/action', authMiddleware, async (req, res) => {
       });
     }
 
-    // Update card status
-    const { error: updateErr } = await supabase
-      .from('recommendation_cards')
+    await supabase.from('recommendation_cards')
       .update({ status: action === 'approve' ? 'approved' : 'rejected', decided_at: new Date().toISOString(), agent_session_id: agentSessionId })
       .eq('id', cardId);
-    if (updateErr) throw new Error(updateErr.message);
 
-    res.json({ success: true, data: { status: action === 'approve' ? 'approved' : 'rejected', agent_session_id: agentSessionId } });
+    res.json({ success: true, data: { status: action === 'approve' ? 'approved' : 'rejected', agent_session_id: agentSessionId, agent_thread_id: agentThreadId } });
   } catch (err) {
     console.error('Card action error:', err.message);
     res.status(500).json({ success: false, error: err.message });

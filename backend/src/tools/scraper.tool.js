@@ -16,7 +16,7 @@ let _llm = null;
 function getLLM() {
   if (!_llm) {
     _llm = new ChatGoogleGenerativeAI({
-      model: 'gemini-1.5-flash',
+      model: 'gemini-2.5-flash',
       apiKey: process.env.GEMINI_API_KEY,
       temperature: 0,
       maxOutputTokens: 1500,
@@ -93,33 +93,57 @@ async function compressDom(html, url) {
 
 // ── Core scraper ───────────────────────────────────────────────────────────────
 
-async function scrapeSinglePage(browser, url) {
+async function scrapeSinglePage(browser, url, options = {}) {
+  const { fullPage = false } = options;
   const page = await browser.newPage();
   try {
     await page.setViewport({ width: 1280, height: 800 });
-    await page.setUserAgent('Mozilla/5.0 (compatible; AuraDesignBot/1.0; +https://auradesign.ai)');
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
 
     await page.setRequestInterception(true);
     page.on('request', (req) => {
-      if (['font', 'media'].includes(req.resourceType())) req.abort();
+      const rt = req.resourceType();
+      // Block fonts, media, and tracking to speed up load
+      if (['font', 'media', 'websocket'].includes(rt)) req.abort();
       else req.continue();
     });
 
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-    await new Promise(r => setTimeout(r, 600));
+    // Try load first, fall back to domcontentloaded — avoids hanging on networkidle2
+    try {
+      await page.goto(url, { waitUntil: 'load', timeout: 20000 });
+    } catch {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    }
+
+    // Short settle wait for lazy-rendered content
+    await new Promise(r => setTimeout(r, 800));
 
     const html = await page.content();
     const css = await extractCSS(page);
     const pageTitle = await page.title();
-    const elementCount = await page.$$eval('*', els => els.length);
+    const elementCount = await page.$$eval('*', els => els.length).catch(() => 0);
     const hasCta = await page.$$eval(
       'button, a[class*="btn"], a[class*="cta"], [class*="button"]',
       els => els.length > 0
-    );
+    ).catch(() => false);
 
     const ssId = uuidv4();
     const ssPath = path.join(UPLOADS_DIR, `${ssId}.png`);
-    await page.screenshot({ path: ssPath, fullPage: false });
+
+    // For heatmap surveys use fullPage; for chat analysis use viewport only
+    if (fullPage) {
+      // Scroll to bottom to trigger lazy images, then screenshot full page
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await new Promise(r => setTimeout(r, 500));
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await new Promise(r => setTimeout(r, 300));
+      await page.screenshot({ path: ssPath, fullPage: true });
+    } else {
+      await page.screenshot({ path: ssPath, fullPage: false });
+    }
 
     const domSummary = await compressDom(html, url);
 
@@ -136,7 +160,7 @@ async function scrapeSinglePage(browser, url) {
       has_cta: hasCta,
     };
   } finally {
-    await page.close();
+    await page.close().catch(() => {});
   }
 }
 
@@ -145,7 +169,7 @@ async function discoverPages(browser, rootUrl, maxPages = 5) {
   const urls = new Set([rootUrl]);
 
   try {
-    await page.goto(rootUrl, { waitUntil: 'networkidle2', timeout: 20000 });
+    await page.goto(rootUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
     const baseHost = new URL(rootUrl).host;
 
     const links = await page.$$eval('a[href]', (anchors, host) =>
@@ -153,7 +177,7 @@ async function discoverPages(browser, rootUrl, maxPages = 5) {
         .map(a => a.href)
         .filter(h => { try { return new URL(h).host === host; } catch { return false; } }),
       baseHost
-    );
+    ).catch(() => []);
 
     const priority = links.filter(u => {
       const p = u.toLowerCase();
@@ -169,7 +193,7 @@ async function discoverPages(browser, rootUrl, maxPages = 5) {
   } catch (err) {
     console.warn('Page discovery warning:', err.message);
   } finally {
-    await page.close();
+    await page.close().catch(() => {});
   }
 
   return Array.from(urls).slice(0, maxPages);
@@ -178,39 +202,56 @@ async function discoverPages(browser, rootUrl, maxPages = 5) {
 // ── Main export ────────────────────────────────────────────────────────────────
 
 async function scrapeWebsite(rootUrl, options = {}) {
-  const { maxPages = 5 } = options;
+  const { maxPages = 5, fullPage = false } = options;
 
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote',
-    ],
-  });
+  // Overall hard timeout: 90s for multi-page, 45s for single page
+  const TIMEOUT_MS = maxPages === 1 ? 45000 : 90000;
 
-  try {
-    const pageUrls = await discoverPages(browser, rootUrl, maxPages);
-    console.log(`  Scraping ${pageUrls.length} pages:`, pageUrls);
+  const scrapePromise = (async () => {
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-extensions',
+        '--disable-background-networking',
+      ],
+    });
 
-    const results = {};
+    try {
+      const pageUrls = maxPages === 1
+        ? [rootUrl]
+        : await discoverPages(browser, rootUrl, maxPages);
+      console.log(`  Scraping ${pageUrls.length} pages:`, pageUrls);
 
-    for (let i = 0; i < pageUrls.length; i += 3) {
-      const chunk = pageUrls.slice(i, i + 3);
-      const settled = await Promise.allSettled(chunk.map(url => scrapeSinglePage(browser, url)));
-      for (const r of settled) {
-        if (r.status === 'fulfilled') results[r.value.page_key] = r.value;
-        else console.warn('  Page scrape failed:', r.reason?.message);
+      const results = {};
+
+      for (let i = 0; i < pageUrls.length; i += 3) {
+        const chunk = pageUrls.slice(i, i + 3);
+        const settled = await Promise.allSettled(
+          chunk.map(url => scrapeSinglePage(browser, url, { fullPage }))
+        );
+        for (const r of settled) {
+          if (r.status === 'fulfilled') results[r.value.page_key] = r.value;
+          else console.warn('  Page scrape failed:', r.reason?.message);
+        }
       }
-    }
 
-    return results;
-  } finally {
-    await browser.close();
-  }
+      return results;
+    } finally {
+      await browser.close().catch(() => {});
+    }
+  })();
+
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`Scrape timed out after ${TIMEOUT_MS / 1000}s`)), TIMEOUT_MS)
+  );
+
+  return Promise.race([scrapePromise, timeoutPromise]);
 }
 
 module.exports = { scrapeWebsite, normalizePageKey, classifyPage };
